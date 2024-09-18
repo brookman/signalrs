@@ -2,11 +2,14 @@
 
 use super::{hub::Hub, transport, SignalRClient};
 use crate::{
-    messages::ClientMessage, protocol::NegotiateResponseV0, transport::error::TransportError,
+    messages::ClientMessage,
+    protocol::{NegotiateResponseV0, NegotiateResponseWithUrlV0},
+    transport::error::TransportError,
 };
+use reqwest::header::HeaderValue;
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{tungstenite::client::IntoClientRequest, MaybeTlsStream, WebSocketStream};
 use tracing::*;
 
 /// [`SignalRClient`] builder.
@@ -148,15 +151,9 @@ impl ClientBuilder {
     ///
     /// Performs protocol negotiation and server handshake.
     pub async fn build(self) -> Result<SignalRClient, BuilderError> {
-        let negotiate_response = self.get_server_supported_features().await?;
+        let negotiate_response = self.negotiate().await?;
 
-        if !can_connect(negotiate_response) {
-            return Err(BuilderError::Negotiate {
-                source: NegotiateError::Unsupported,
-            });
-        }
-
-        let mut ws_handle = self.connect_websocket().await?;
+        let mut ws_handle = self.connect_websocket(negotiate_response).await?;
 
         let (tx, rx) = flume::bounded::<ClientMessage>(1);
 
@@ -177,14 +174,19 @@ impl ClientBuilder {
 
     async fn connect_websocket(
         &self,
+        negotiate_response: NegotiateResponseWithUrlV0,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, BuilderError> {
-        let scheme = self.get_ws_scheme();
-        let domain_and_path = self.get_domain_with_path();
-        let query = self.get_query_string();
 
-        let url = format!("{}://{}?{}", scheme, domain_and_path, query);
+        let url = negotiate_response.url.unwrap().replace("https://", "wss://");
+        let token = negotiate_response.access_token.unwrap();
 
-        let (ws_handle, _) = tokio_tungstenite::connect_async(url)
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(format!("Bearer {token}").as_str()).unwrap(),
+        );
+
+        let (ws_handle, _) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(|error| BuilderError::Transport {
                 source: TransportError::Websocket { source: error },
@@ -193,7 +195,7 @@ impl ClientBuilder {
         Ok(ws_handle)
     }
 
-    async fn get_server_supported_features(&self) -> Result<NegotiateResponseV0, NegotiateError> {
+    async fn negotiate(&self) -> Result<NegotiateResponseWithUrlV0, NegotiateError> {
         let negotiate_endpoint = format!(
             "{}://{}/negotiate?{}",
             self.get_http_scheme(),
@@ -210,8 +212,8 @@ impl ClientBuilder {
         };
 
         let http_response = request.send().await?.error_for_status()?;
-
-        let response: NegotiateResponseV0 = serde_json::from_str(&http_response.text().await?)?;
+        let response_string = http_response.text().await?;
+        let response: NegotiateResponseWithUrlV0 = serde_json::from_str(&response_string)?;
 
         Ok(response)
     }

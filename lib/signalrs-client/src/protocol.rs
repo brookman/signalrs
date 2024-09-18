@@ -15,6 +15,13 @@ pub struct NegotiateResponseV0 {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NegotiateResponseWithUrlV0 {
+    pub url: Option<String>,
+    pub access_token: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransportSpec {
     pub transport: String,
     pub transfer_formats: Vec<String>,
