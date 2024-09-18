@@ -153,17 +153,18 @@ impl ClientBuilder {
     pub async fn build(self) -> Result<SignalRClient, BuilderError> {
         let negotiate_response = self.negotiate().await?;
 
-        let mut ws_handle = self.connect_websocket(negotiate_response).await?;
+        let ws_handle = self.connect_websocket(negotiate_response).await?;
+        let mut wrapper = transport::websocket::WebsocketWrapper::new(ws_handle);
 
         let (tx, rx) = flume::bounded::<ClientMessage>(1);
 
         let (transport_handle, client) = crate::new_client(tx, self.hub);
 
-        transport::websocket::handshake(&mut ws_handle)
+        transport::websocket::handshake(&mut wrapper)
             .await
             .map_err(|error| BuilderError::Transport { source: error })?;
 
-        let transport_future = transport::websocket::websocket_hub(ws_handle, transport_handle, rx);
+        let transport_future = transport::websocket::websocket_hub(wrapper, transport_handle, rx);
 
         tokio::spawn(transport_future);
 

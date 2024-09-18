@@ -20,13 +20,61 @@ enum Event {
     None,
 }
 
-pub(crate) async fn handshake(
-    websocket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-) -> Result<(), TransportError> {
+pub struct WebsocketWrapper {
+    pub websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    buffered_messages: Vec<Message>,
+}
+
+impl WebsocketWrapper {
+    pub fn new(websocket: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        WebsocketWrapper {
+            websocket,
+            buffered_messages: vec![],
+        }
+    }
+
+    pub async fn next_message(&mut self) -> Option<Result<Message, TransportError>> {
+        if self.buffered_messages.is_empty() {
+            if let Some(m) = self.websocket.next().await {
+                if let Err(error) = m {
+                    return Some(Err(TransportError::Websocket { source: error }));
+                }
+                if let Ok(new_message) = m {
+                    match new_message {
+                        Message::Text(value) => {
+                            info!("!!! received message: {value}");
+                            self.buffered_messages.extend(
+                                value
+                                    .split(messages::RECORD_SEPARATOR)
+                                    .map(|i| messages::strip_record_separator(&i))
+                                    .filter(|i| !i.is_empty())
+                                    .map(|i| Message::Text(i.to_string())),
+                            );
+                        }
+                        m => {
+                            self.buffered_messages.push(m);
+                        }
+                    }
+                }
+            } else {
+                return None;
+            }
+        }
+
+        // return the first message
+        if !self.buffered_messages.is_empty() {
+            Some(Ok(self.buffered_messages.remove(0)))
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) async fn handshake(wrapper: &mut WebsocketWrapper) -> Result<(), TransportError> {
     let request = messages::to_json(&HandshakeRequest::new("json"))?;
-    websocket.send(Message::Text(request)).await?;
-    let response = websocket
-        .next()
+    wrapper.websocket.send(Message::Text(request)).await?;
+    let response = wrapper
+        .next_message()
         .await
         .ok_or_else(|| TransportError::BadReceive)??;
 
@@ -49,7 +97,7 @@ pub(crate) async fn handshake(
 }
 
 pub(crate) async fn websocket_hub<'a>(
-    mut websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    mut wrapper: WebsocketWrapper,
     client: TransportClientHandle,
     messages_to_send: flume::Receiver<ClientMessage>,
 ) {
@@ -60,16 +108,16 @@ pub(crate) async fn websocket_hub<'a>(
         let span = debug_span!("websocket");
         select! {
             _ = ticks.tick().fuse() => {
-                send_ping(&mut websocket).await;
+                send_ping(&mut wrapper.websocket).await;
             },
             to_send = messages_to_send.next() => {
                 if to_send.is_none() {
                     break;
                 }
 
-                send_message(&mut websocket, to_send.unwrap()).instrument(span).await;
+                send_message(&mut wrapper.websocket, to_send.unwrap()).instrument(span).await;
             },
-            received = websocket.next() => {
+            received = wrapper.next_message().fuse() => {
                 if received.is_none() {
                     break;
                 }
@@ -78,7 +126,7 @@ pub(crate) async fn websocket_hub<'a>(
 
                 match received.unwrap() {
                     Ok(message) => {
-                        match incoming_message(&mut websocket, message, &client).instrument(span).await {
+                        match incoming_message(&mut wrapper.websocket, message, &client).instrument(span).await {
                             Ok(Event::None) => {  },
                             Ok(Event::Close) => break,
                             Err(error) => incoming_message_error(error)
